@@ -1,0 +1,165 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_IMAGE = "srush634/docker-webapp:latest"
+        SONAR_HOST_URL = 'http://localhost:9000'
+        KUBECONFIG = "/var/lib/jenkins/.kube/config"
+    }
+
+    stages {
+        stage('Start Minikube') {
+            steps {
+                script {
+                    sh '''
+                        if [ -f "/var/lib/jenkins/.kube/config" ]; then
+                            echo "Kubeconfig exists. Checking permissions..."
+                            ls -l /var/lib/jenkins/.kube/config
+                        else
+                            echo "Kubeconfig file missing. Minikube might not be initialized."
+                        fi
+                        echo "Checking Minikube status..."
+                        if ! minikube status > /dev/null 2>&1; then
+                            echo "Minikube is not running. Deleting and restarting..."
+                            minikube delete
+                            rm -rf /var/lib/jenkins/.minikube /tmp/juju-*
+                            minikube start --driver=docker --image-mirror-country=global --force --kubernetes-version=v1.23.0
+                        else
+                            echo "Minikube is already running."
+                        fi
+
+                        echo "Fixing permissions for Minikube..."
+                        sudo chmod -R 777 /var/lib/jenkins/.minikube /tmp/juju-*
+
+                        echo "Setting up Minikube Docker environment..."
+                        eval $(minikube docker-env)
+                    '''
+                }
+            }
+        }
+
+        stage('SCM Checkout') {
+            steps {
+                git branch: 'main', url: 'https://github.com/srushti-bhosale/CDAC-project.git'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            environment {
+                SONAR_AUTH_TOKEN = credentials('sonarqube')
+            }
+            steps {
+                script {
+                    sh '''
+                    /opt/sonar-scanner/bin/sonar-scanner \
+                    -Dsonar.projectKey=sample_project \
+                    -Dsonar.host.url=$SONAR_HOST_URL \
+                    -Dsonar.login=$SONAR_AUTH_TOKEN
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh "docker build -t ${DOCKER_IMAGE} ."
+                }
+            }
+        }
+
+        stage('Security Scan - Trivy') {
+            steps {
+                script {
+                    sh '''
+                    trivy image ${DOCKER_IMAGE} || echo "Security scan completed with warnings"
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Image to DockerHub') {
+            steps {
+                withCredentials([string(credentialsId: 'DOCKER_HUB_TOKEN', variable: 'DOCKER_HUB_TOKEN')]) {
+                    script {
+                        sh '''
+                        echo $DOCKER_HUB_TOKEN | docker login -u srush634 --password-stdin
+                        docker push ${DOCKER_IMAGE}
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Minikube') {
+            steps {
+                script {
+                    sh '''
+                    export KUBECONFIG=/var/lib/jenkins/.kube/config
+                    echo "Deploying application to Minikube..."
+                    
+                    kubectl delete deployment webapp --ignore-not-found=true
+                    kubectl apply -f deployment.yaml
+                    kubectl apply -f service.yaml
+
+                    echo "Waiting for pods to be ready..."
+                    kubectl wait --for=condition=ready pod -l app=webapp --timeout=90s || (kubectl get pods -l app=webapp && kubectl logs -l app=webapp --tail=20 && exit 1)
+                    '''
+                }
+            }
+        }
+
+        stage('Expose Minikube Service') {
+            steps {
+                script {
+                    sh '''
+                    echo "Checking if service exists..."
+                    kubectl get svc webapp-service || (echo "Service does not exist" && exit 1)
+
+                    echo "Retrieving running pod name..."
+                    POD_NAME=$(kubectl get pods -l app=webapp -o jsonpath='{.items[0].metadata.name}')
+
+                    if [[ -z "$POD_NAME" ]]; then
+                        echo "No running pod found for webapp-service!"
+                        exit 1
+                    fi
+
+                    echo "Exposing service..."
+                    minikube service webapp-service --url
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    sh '''
+                    echo "Checking pods..."
+                    kubectl get pods
+
+                    echo "Checking deployments..."
+                    kubectl get deployments
+
+                    echo "Checking services..."
+                    kubectl get services
+                    '''
+                }
+            }
+        }
+
+        stage('Access Website') {
+            steps {
+                script {
+                    sh '''
+                    echo "Fetching Minikube service URL..."
+                    URL=$(minikube service webapp-service --url)
+                    
+                    echo "Your website is available at: $URL"
+                    '''
+                }
+            }
+        }
+    }
+}
+

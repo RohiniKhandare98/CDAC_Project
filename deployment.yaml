@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp-deployment  # Changed name to match the service
+  labels:
+    app: webapp  # Changed label to match the service selector
+spec:
+  replicas: 2  # Keep two replicas for high availability
+  selector:
+    matchLabels:
+      app: webapp  # Must match the service selector
+  template:
+    metadata:
+      labels:
+        app: webapp  # Ensure pods have this label
+    spec:
+      containers:
+        - name: webapp-container
+          image: srush634/docker-webapp:latest  # Using your Docker Hub image
+          ports:
+            - containerPort: 80  # Matches the targetPort in service.yaml
